@@ -8,7 +8,7 @@ from typing import Any
 
 import httpx
 
-from jarvis_log_client.client import _get_auth_headers
+from jarvis_log_client.client import _get_auth_headers, _get_log_endpoint
 
 
 class JarvisLogHandler(logging.Handler):
@@ -146,7 +146,7 @@ class JarvisLogHandler(logging.Handler):
 
         try:
             self._client.post(
-                f"{self.server_url}/api/v0/logs/batch",
+                f"{self.server_url}{_get_log_endpoint()}",
                 json={"logs": batch},
                 headers=headers,
             )

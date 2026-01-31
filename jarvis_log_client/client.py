@@ -11,6 +11,8 @@ import httpx
 
 # Module-level credentials cache
 _app_credentials: dict[str, str] = {}
+_node_credentials: dict[str, str] = {}
+_auth_mode: str = "app"  # "app" or "node"
 
 
 def init(app_id: str, app_key: str) -> None:
@@ -27,21 +29,60 @@ def init(app_id: str, app_key: str) -> None:
         from jarvis_log_client import init
         init(app_id="my-service", app_key=os.getenv("JARVIS_APP_KEY"))
     """
+    global _auth_mode
     _app_credentials["app_id"] = app_id
     _app_credentials["app_key"] = app_key
+    _auth_mode = "app"
+
+
+def init_node(node_id: str, node_key: str) -> None:
+    """
+    Initialize jarvis-log-client with node credentials.
+
+    Call this once at application startup before creating any JarvisLogger instances.
+    Use this for nodes (e.g., Pi Zero devices) that authenticate via jarvis-auth's
+    centralized node authentication.
+
+    Args:
+        node_id: The node's ID registered with jarvis-auth
+        node_key: The node's secret key from jarvis-auth
+
+    Usage:
+        from jarvis_log_client import init_node
+        init_node(node_id="kitchen-pi", node_key=os.getenv("JARVIS_NODE_KEY"))
+    """
+    global _auth_mode
+    _node_credentials["node_id"] = node_id
+    _node_credentials["node_key"] = node_key
+    _auth_mode = "node"
 
 
 def _get_auth_headers() -> dict[str, str]:
-    """Get authentication headers if credentials are configured."""
-    app_id = _app_credentials.get("app_id") or os.getenv("JARVIS_APP_ID")
-    app_key = _app_credentials.get("app_key") or os.getenv("JARVIS_APP_KEY")
-
-    if app_id and app_key:
-        return {
-            "X-Jarvis-App-Id": app_id,
-            "X-Jarvis-App-Key": app_key,
-        }
+    """Get authentication headers based on auth mode."""
+    if _auth_mode == "node":
+        node_id = _node_credentials.get("node_id") or os.getenv("JARVIS_NODE_ID")
+        node_key = _node_credentials.get("node_key") or os.getenv("JARVIS_NODE_KEY")
+        if node_id and node_key:
+            return {
+                "X-Node-Id": node_id,
+                "X-Node-Key": node_key,
+            }
+    else:
+        app_id = _app_credentials.get("app_id") or os.getenv("JARVIS_APP_ID")
+        app_key = _app_credentials.get("app_key") or os.getenv("JARVIS_APP_KEY")
+        if app_id and app_key:
+            return {
+                "X-Jarvis-App-Id": app_id,
+                "X-Jarvis-App-Key": app_key,
+            }
     return {}
+
+
+def _get_log_endpoint() -> str:
+    """Get the log endpoint path based on auth mode."""
+    if _auth_mode == "node":
+        return "/api/v0/node/logs/batch"
+    return "/api/v0/logs/batch"
 
 
 class JarvisLogger:
@@ -148,7 +189,7 @@ class JarvisLogger:
 
         try:
             response = self._client.post(
-                f"{self.server_url}/api/v0/logs/batch",
+                f"{self.server_url}{_get_log_endpoint()}",
                 json={"logs": batch},
                 headers=headers,
             )

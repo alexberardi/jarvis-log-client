@@ -5,8 +5,21 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 
-from jarvis_log_client import init, JarvisLogger
-from jarvis_log_client.client import _app_credentials, _get_auth_headers
+from jarvis_log_client import init, init_node, JarvisLogger
+from jarvis_log_client.client import (
+    _app_credentials,
+    _node_credentials,
+    _get_auth_headers,
+    _get_log_endpoint,
+)
+import jarvis_log_client.client as client_module
+
+
+def _reset_auth_state():
+    """Reset all auth state to defaults."""
+    _app_credentials.clear()
+    _node_credentials.clear()
+    client_module._auth_mode = "app"
 
 
 class TestInit:
@@ -14,7 +27,7 @@ class TestInit:
 
     def setup_method(self):
         """Clear credentials before each test."""
-        _app_credentials.clear()
+        _reset_auth_state()
 
     def test_init_stores_credentials(self):
         """Test that init() stores credentials."""
@@ -35,7 +48,7 @@ class TestGetAuthHeaders:
 
     def setup_method(self):
         """Clear credentials before each test."""
-        _app_credentials.clear()
+        _reset_auth_state()
 
     def test_returns_headers_from_init(self):
         """Test headers from init()."""
@@ -92,7 +105,7 @@ class TestJarvisLogger:
 
     def setup_method(self):
         """Clear credentials before each test."""
-        _app_credentials.clear()
+        _reset_auth_state()
 
     def test_logger_creation(self):
         """Test basic logger creation."""
@@ -183,7 +196,7 @@ class TestJarvisLoggerFlush:
 
     def setup_method(self):
         """Clear credentials before each test."""
-        _app_credentials.clear()
+        _reset_auth_state()
 
     def test_fallback_to_console_on_error(self):
         """Test that logs fall back to console on server error."""
@@ -203,3 +216,109 @@ class TestJarvisLoggerFlush:
         # Manually trigger flush - should not raise
         logger._flush_batch()
         logger.shutdown()
+
+
+class TestInitNode:
+    """Tests for init_node() function."""
+
+    def setup_method(self):
+        """Clear credentials before each test."""
+        _reset_auth_state()
+
+    def test_init_node_stores_credentials(self):
+        """Test that init_node() stores node credentials."""
+        init_node(node_id="test-node", node_key="test-key")
+        assert _node_credentials["node_id"] == "test-node"
+        assert _node_credentials["node_key"] == "test-key"
+
+    def test_init_node_sets_auth_mode(self):
+        """Test that init_node() sets auth mode to 'node'."""
+        init_node(node_id="test-node", node_key="test-key")
+        assert client_module._auth_mode == "node"
+
+    def test_init_after_init_node_switches_back(self):
+        """Test that init() switches back to app mode."""
+        init_node(node_id="test-node", node_key="test-key")
+        assert client_module._auth_mode == "node"
+        init(app_id="test-app", app_key="test-app-key")
+        assert client_module._auth_mode == "app"
+
+
+class TestNodeAuthHeaders:
+    """Tests for node authentication headers."""
+
+    def setup_method(self):
+        """Clear credentials before each test."""
+        _reset_auth_state()
+
+    def test_returns_node_headers_from_init_node(self):
+        """Test headers from init_node()."""
+        init_node(node_id="my-node", node_key="my-node-key")
+        headers = _get_auth_headers()
+        assert headers == {
+            "X-Node-Id": "my-node",
+            "X-Node-Key": "my-node-key",
+        }
+
+    def test_returns_node_headers_from_env(self):
+        """Test node headers from environment variables."""
+        client_module._auth_mode = "node"
+        with patch.dict(os.environ, {
+            "JARVIS_NODE_ID": "env-node",
+            "JARVIS_NODE_KEY": "env-node-key",
+        }):
+            headers = _get_auth_headers()
+            assert headers == {
+                "X-Node-Id": "env-node",
+                "X-Node-Key": "env-node-key",
+            }
+
+    def test_init_node_takes_precedence_over_env(self):
+        """Test that init_node() credentials take precedence over env vars."""
+        init_node(node_id="init-node", node_key="init-node-key")
+        with patch.dict(os.environ, {
+            "JARVIS_NODE_ID": "env-node",
+            "JARVIS_NODE_KEY": "env-node-key",
+        }):
+            headers = _get_auth_headers()
+            assert headers["X-Node-Id"] == "init-node"
+            assert headers["X-Node-Key"] == "init-node-key"
+
+
+class TestGetLogEndpoint:
+    """Tests for _get_log_endpoint() function."""
+
+    def setup_method(self):
+        """Clear credentials before each test."""
+        _reset_auth_state()
+
+    def test_returns_app_endpoint_by_default(self):
+        """Test that app endpoint is returned by default."""
+        endpoint = _get_log_endpoint()
+        assert endpoint == "/api/v0/logs/batch"
+
+    def test_returns_app_endpoint_after_init(self):
+        """Test that app endpoint is returned after init()."""
+        init(app_id="test-app", app_key="test-key")
+        endpoint = _get_log_endpoint()
+        assert endpoint == "/api/v0/logs/batch"
+
+    def test_returns_node_endpoint_after_init_node(self):
+        """Test that node endpoint is returned after init_node()."""
+        init_node(node_id="test-node", node_key="test-key")
+        endpoint = _get_log_endpoint()
+        assert endpoint == "/api/v0/node/logs/batch"
+
+    def test_switching_auth_mode_changes_endpoint(self):
+        """Test that switching auth mode changes the endpoint."""
+        # Start with app mode
+        init(app_id="app", app_key="key")
+        assert _get_log_endpoint() == "/api/v0/logs/batch"
+
+        # Switch to node mode
+        init_node(node_id="node", node_key="key")
+        assert _get_log_endpoint() == "/api/v0/node/logs/batch"
+
+        # Switch back to app mode
+        init(app_id="app2", app_key="key2")
+        assert _get_log_endpoint() == "/api/v0/logs/batch"
