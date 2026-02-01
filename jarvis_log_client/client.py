@@ -8,6 +8,32 @@ from typing import Any
 
 import httpx
 
+_DEFAULT_LOGS_URL = "http://localhost:8006"
+
+
+def _get_logs_url() -> str:
+    """
+    Get the jarvis-logs URL.
+
+    Priority:
+    1. jarvis-config-client (if initialized)
+    2. JARVIS_LOGS_URL env var
+    3. Default: http://localhost:8006
+    """
+    # Try config client first (if available and initialized)
+    try:
+        from jarvis_config_client import get_service_url
+        url = get_service_url("jarvis-logs")
+        if url:
+            return url
+    except (ImportError, RuntimeError):
+        # ImportError: jarvis-config-client not installed
+        # RuntimeError: config client not initialized
+        pass
+
+    # Fall back to env var or default
+    return os.getenv("JARVIS_LOGS_URL", _DEFAULT_LOGS_URL)
+
 
 # Module-level credentials cache
 _app_credentials: dict[str, str] = {}
@@ -114,9 +140,7 @@ class JarvisLogger:
         flush_interval: float = 5.0,
     ):
         self.service = service
-        self.server_url = server_url or os.getenv(
-            "JARVIS_LOGS_URL", "http://localhost:8006"
-        )
+        self.server_url = server_url or _get_logs_url()
         self.console_level = getattr(logging, console_level.upper(), logging.WARNING)
         self.remote_level = getattr(logging, remote_level.upper(), logging.DEBUG)
         self.batch_size = batch_size

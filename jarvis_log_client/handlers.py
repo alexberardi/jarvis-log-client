@@ -1,6 +1,5 @@
 import json
 import logging
-import os
 import queue
 import threading
 from datetime import datetime
@@ -8,7 +7,7 @@ from typing import Any
 
 import httpx
 
-from jarvis_log_client.client import _get_auth_headers, _get_log_endpoint
+from jarvis_log_client.client import _get_auth_headers, _get_log_endpoint, _get_logs_url
 
 
 class JarvisLogHandler(logging.Handler):
@@ -38,9 +37,7 @@ class JarvisLogHandler(logging.Handler):
     ):
         super().__init__(level=level)
         self.service = service
-        self.server_url = server_url or os.getenv(
-            "JARVIS_LOGS_URL", "http://localhost:8006"
-        )
+        self.server_url = server_url or _get_logs_url()
         self.batch_size = batch_size
         self.flush_interval = flush_interval
 

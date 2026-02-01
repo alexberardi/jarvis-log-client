@@ -53,9 +53,18 @@ jarvis_log_client/
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `JARVIS_LOGS_URL` | http://localhost:8006 | Logs server URL |
+| `JARVIS_LOGS_URL` | http://localhost:8006 | Fallback logs server URL |
 | `JARVIS_APP_ID` | - | App ID for authentication |
 | `JARVIS_APP_KEY` | - | App key for authentication |
+
+## Service Discovery
+
+If `jarvis-config-client` is installed and initialized by the host service, the logs URL is automatically fetched from `jarvis-config-service`. Otherwise falls back to `JARVIS_LOGS_URL` env var.
+
+Priority:
+1. jarvis-config-client (if initialized)
+2. `JARVIS_LOGS_URL` env var
+3. Default: `http://localhost:8006`
 
 ## Features
 
