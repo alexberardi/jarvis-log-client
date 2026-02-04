@@ -183,8 +183,8 @@ class JarvisLogger:
         while not self._shutdown.is_set():
             try:
                 self._flush_batch()
-            except Exception as e:
-                self._console_logger.warning(f"Log flush error: {e}")
+            except (httpx.HTTPError, OSError) as e:
+                self._console_logger.warning(f"Log flush error ({type(e).__name__}): {e}")
 
             # Wait for flush interval or shutdown
             self._shutdown.wait(timeout=self.flush_interval)
