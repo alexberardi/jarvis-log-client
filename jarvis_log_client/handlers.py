@@ -104,7 +104,8 @@ class JarvisLogHandler(logging.Handler):
             self._queue.put_nowait(entry)
         except queue.Full:
             pass  # Drop log if queue is full
-        except Exception:
+        except (TypeError, ValueError, AttributeError) as e:
+            # Log serialization or attribute errors for debugging
             self.handleError(record)
 
     def _flush_loop(self) -> None:
@@ -114,8 +115,8 @@ class JarvisLogHandler(logging.Handler):
         while not self._shutdown.is_set():
             try:
                 self._flush_batch()
-            except Exception:
-                pass  # Silently ignore flush errors
+            except (httpx.HTTPError, OSError):
+                pass  # Silently ignore network/transport errors
 
             self._shutdown.wait(timeout=self.flush_interval)
 

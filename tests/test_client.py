@@ -1,6 +1,7 @@
 """Tests for JarvisLogger client."""
 
 import os
+import time
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -210,7 +211,6 @@ class TestJarvisLoggerFlush:
         logger.error("Test error")
 
         # Wait for flush to complete (or timeout)
-        import time
         time.sleep(0.5)
 
         # Manually trigger flush - should not raise
