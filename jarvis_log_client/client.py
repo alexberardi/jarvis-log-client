@@ -94,8 +94,8 @@ def _get_auth_headers() -> dict[str, str]:
                 "X-Node-Key": node_key,
             }
     else:
-        app_id = _app_credentials.get("app_id") or os.getenv("JARVIS_AUTH_APP_ID") or os.getenv("JARVIS_APP_ID")
-        app_key = _app_credentials.get("app_key") or os.getenv("JARVIS_AUTH_APP_KEY") or os.getenv("JARVIS_APP_KEY")
+        app_id = _app_credentials.get("app_id") or os.getenv("JARVIS_APP_ID")
+        app_key = _app_credentials.get("app_key") or os.getenv("JARVIS_APP_KEY")
         if app_id and app_key:
             return {
                 "X-Jarvis-App-Id": app_id,
