@@ -54,8 +54,10 @@ jarvis_log_client/
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `JARVIS_LOGS_URL` | http://localhost:8006 | Fallback logs server URL |
-| `JARVIS_APP_ID` | - | App ID for authentication |
-| `JARVIS_APP_KEY` | - | App key for authentication |
+| `JARVIS_AUTH_APP_ID` | - | App ID for authentication (preferred) |
+| `JARVIS_AUTH_APP_KEY` | - | App key for authentication (preferred) |
+| `JARVIS_APP_ID` | - | App ID fallback (legacy) |
+| `JARVIS_APP_KEY` | - | App key fallback (legacy) |
 
 ## Service Discovery
 
