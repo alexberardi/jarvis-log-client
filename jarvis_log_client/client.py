@@ -23,7 +23,7 @@ def _get_logs_url() -> str:
     # Try config client first (if available and initialized)
     try:
         from jarvis_config_client import get_service_url
-        url = get_service_url("jarvis-logs")
+        url = get_service_url("logs")
         if url:
             return url
     except (ImportError, RuntimeError):
