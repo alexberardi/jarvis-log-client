@@ -98,7 +98,7 @@ logger.error("Error occurred", extra={"request_id": "abc123"})
 |----------|---------|-------------|
 | `JARVIS_APP_ID` | (none) | App ID for authentication |
 | `JARVIS_APP_KEY` | (none) | App key for authentication |
-| `JARVIS_LOGS_URL` | `http://localhost:8006` | jarvis-logs server URL |
+| `JARVIS_LOGS_URL` | `http://localhost:7702` | jarvis-logs server URL |
 
 ## Features
 
@@ -115,7 +115,7 @@ logger.error("Error occurred", extra={"request_id": "abc123"})
 
 ```bash
 # Create app client (run once)
-curl -X POST http://localhost:8007/admin/app-clients \
+curl -X POST http://localhost:7701/admin/app-clients \
   -H "X-Jarvis-Admin-Token: $ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"app_id": "my-service", "name": "My Service"}'

@@ -8,7 +8,7 @@ from typing import Any
 
 import httpx
 
-_DEFAULT_LOGS_URL = "http://localhost:8006"
+_DEFAULT_LOGS_URL = "http://localhost:7702"
 
 
 def _get_logs_url() -> str:
@@ -18,7 +18,7 @@ def _get_logs_url() -> str:
     Priority:
     1. jarvis-config-client (if initialized)
     2. JARVIS_LOGS_URL env var
-    3. Default: http://localhost:8006
+    3. Default: http://localhost:7702
     """
     # Try config client first (if available and initialized)
     try:

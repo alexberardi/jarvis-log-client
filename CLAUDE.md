@@ -21,7 +21,7 @@ from jarvis_log_client import init, JarvisLogger
 init(
     app_id="my-service",
     app_key=os.getenv("JARVIS_APP_KEY"),
-    logs_url="http://localhost:8006"  # optional
+    logs_url="http://localhost:7702"  # optional
 )
 
 # Create logger
@@ -53,7 +53,7 @@ jarvis_log_client/
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `JARVIS_LOGS_URL` | http://localhost:8006 | Fallback logs server URL |
+| `JARVIS_LOGS_URL` | http://localhost:7702 | Fallback logs server URL |
 | `JARVIS_AUTH_APP_ID` | - | App ID for authentication (preferred) |
 | `JARVIS_AUTH_APP_KEY` | - | App key for authentication (preferred) |
 | `JARVIS_APP_ID` | - | App ID fallback (legacy) |
@@ -66,7 +66,7 @@ If `jarvis-config-client` is installed and initialized by the host service, the 
 Priority:
 1. jarvis-config-client (if initialized)
 2. `JARVIS_LOGS_URL` env var
-3. Default: `http://localhost:8006`
+3. Default: `http://localhost:7702`
 
 ## Features
 

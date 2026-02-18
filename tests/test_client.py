@@ -112,7 +112,7 @@ class TestJarvisLogger:
         """Test basic logger creation."""
         logger = JarvisLogger(service="test-service")
         assert logger.service == "test-service"
-        assert logger.server_url == "http://localhost:8006"
+        assert logger.server_url == "http://localhost:7702"
         logger.shutdown()
 
     def test_logger_custom_url(self):
