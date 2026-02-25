@@ -33,3 +33,6 @@ jobs:
 
     - name: Run tests
       run: pytest -v --tb=short
+
+    - name: Check test coverage
+      run: pytest --cov=jarvis_log_client --cov-report=term-missing --cov-fail-under=80
