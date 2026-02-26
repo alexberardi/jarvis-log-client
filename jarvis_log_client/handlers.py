@@ -91,7 +91,8 @@ class JarvisLogHandler(logging.Handler):
 
             # Add exception info if present
             if record.exc_info:
-                context["exception"] = self.formatException(record.exc_info)
+                formatter = logging.Formatter()
+                context["exception"] = formatter.formatException(record.exc_info)
 
             entry = {
                 "timestamp": datetime.utcfromtimestamp(record.created).isoformat(),
