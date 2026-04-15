@@ -134,7 +134,7 @@ class JarvisLogger:
         self,
         service: str,
         server_url: str | None = None,
-        console_level: str = "WARNING",
+        console_level: str = "INFO",
         remote_level: str = "DEBUG",
         batch_size: int = 50,
         flush_interval: float = 5.0,
