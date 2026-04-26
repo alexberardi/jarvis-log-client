@@ -199,22 +199,107 @@ class TestJarvisLoggerFlush:
         """Clear credentials before each test."""
         _reset_auth_state()
 
-    def test_fallback_to_console_on_error(self):
-        """Test that logs fall back to console on server error."""
+    def test_failed_batch_logs_single_warning_not_per_entry(self):
+        """When the remote post fails, the client must NOT re-emit every
+        queued entry to console. The originals already went to console at
+        emit time via active handlers. Re-emitting on failure produced
+        apparent-duplicate log lines that masked real duplicates and made
+        journal analysis unreliable. Verify only one summary warning is
+        emitted, regardless of batch size."""
         logger = JarvisLogger(
             service="test",
-            server_url="http://nonexistent:9999",
-            console_level="DEBUG",
+            console_level="CRITICAL",
+        )
+        logger.shutdown()
+        logger._shutdown.clear()
+
+        client = MagicMock()
+        rejected = MagicMock()
+        rejected.status_code = 401
+        client.post.return_value = rejected
+        logger._client = client
+
+        warnings: list[str] = []
+        original_warning = logger._console_logger.warning
+
+        def capture_warning(msg, *args, **kwargs):
+            warnings.append(msg % args if args else msg)
+            return original_warning(msg, *args, **kwargs)
+
+        logger._console_logger.warning = capture_warning
+
+        for i in range(5):
+            logger.info(f"entry {i}")
+
+        logger._flush_batch()
+
+        assert len(warnings) == 1, (
+            f"expected exactly one summary warning, got {len(warnings)}: {warnings}"
+        )
+        assert "entries_dropped=5" in warnings[0]
+        assert "401" in warnings[0]
+
+    def test_flush_batch_serializes_non_native_types(self):
+        """A context value that stdlib json can't serialize must not crash
+        the batch — it should be coerced (via .item() / .tolist() / str()).
+        Regression: numpy.float32 in `Wake word score` killed the flush
+        thread on 2026-04-25."""
+
+        class FakeFloat32:
+            def __init__(self, v: float) -> None:
+                self._v = v
+
+            def item(self) -> float:
+                return self._v
+
+        captured: dict = {}
+
+        def fake_post(*_args, content=None, **_kwargs):
+            captured["body"] = content
+            response = MagicMock()
+            response.status_code = 204
+            return response
+
+        logger = JarvisLogger(
+            service="test",
+            console_level="CRITICAL",
+        )
+        logger.shutdown()  # we'll drive the flush manually
+
+        client = MagicMock()
+        client.post.side_effect = fake_post
+        logger._client = client
+        logger._shutdown.clear()
+
+        logger.info("score", score=FakeFloat32(0.963))
+
+        logger._flush_batch()
+
+        assert "body" in captured, "post() was not called"
+        assert b"0.963" in captured["body"]
+
+    def test_flush_loop_survives_serializer_crash(self):
+        """If _flush_batch raises (e.g. broken httpx mock), the daemon loop
+        keeps running so the next batch still gets a chance to be sent."""
+        logger = JarvisLogger(
+            service="test",
+            console_level="CRITICAL",
+            flush_interval=0.05,
         )
 
-        # Log something
-        logger.error("Test error")
+        boom_count = {"n": 0}
 
-        # Wait for flush to complete (or timeout)
-        time.sleep(0.5)
+        def boom():
+            boom_count["n"] += 1
+            raise RuntimeError("simulated serializer failure")
 
-        # Manually trigger flush - should not raise
-        logger._flush_batch()
+        logger._flush_batch = boom
+
+        time.sleep(0.25)
+
+        assert logger._flush_thread.is_alive(), "flush thread died on RuntimeError"
+        assert boom_count["n"] >= 2, "flush_loop did not retry after first crash"
+
         logger.shutdown()
 
 

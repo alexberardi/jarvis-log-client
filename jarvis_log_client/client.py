@@ -1,4 +1,5 @@
 import atexit
+import json
 import logging
 import os
 import queue
@@ -7,6 +8,30 @@ from datetime import datetime
 from typing import Any
 
 import httpx
+
+
+def _json_safe_default(obj: Any) -> Any:
+    """JSON encoder fallback for log payloads.
+
+    Why: log context often carries values that aren't JSON-native — most
+    commonly numpy scalars (e.g. ``oww.predict()`` returns float32). A
+    single such value would raise TypeError out of ``json.dumps`` and,
+    pre-fix, killed the flush daemon thread permanently — silencing all
+    remote logging until the process restarted.
+    """
+    item = getattr(obj, "item", None)
+    if callable(item):
+        try:
+            return item()
+        except Exception:
+            pass
+    tolist = getattr(obj, "tolist", None)
+    if callable(tolist):
+        try:
+            return tolist()
+        except Exception:
+            pass
+    return str(obj)
 
 _DEFAULT_LOGS_URL = "http://localhost:7702"
 
@@ -185,12 +210,25 @@ class JarvisLogger:
                 self._flush_batch()
             except (httpx.HTTPError, OSError) as e:
                 self._console_logger.warning(f"Log flush error ({type(e).__name__}): {e}")
+            except Exception as e:
+                # Anything else (TypeError from a bad serialize, etc.) must
+                # NOT take the daemon thread down — that would silently
+                # disable remote logging for the rest of the process.
+                self._console_logger.error(
+                    f"Log flush thread caught unexpected error, continuing: "
+                    f"{type(e).__name__}: {e}"
+                )
 
             # Wait for flush interval or shutdown
             self._shutdown.wait(timeout=self.flush_interval)
 
         # Final flush on shutdown
-        self._flush_batch()
+        try:
+            self._flush_batch()
+        except Exception as e:
+            self._console_logger.warning(
+                f"Final log flush failed: {type(e).__name__}: {e}"
+            )
         if self._client:
             self._client.close()
 
@@ -211,27 +249,49 @@ class JarvisLogger:
         headers = {"Content-Type": "application/json"}
         headers.update(_get_auth_headers())
 
+        # Serialize ourselves so we can plug in the safe default and
+        # so a bad value drops the batch instead of raising past httpx.
+        try:
+            body = json.dumps(
+                {"logs": batch}, default=_json_safe_default
+            ).encode("utf-8")
+        except (TypeError, ValueError) as e:
+            self._console_logger.warning(
+                f"Log batch dropped (serialize error): {type(e).__name__}: {e}"
+            )
+            return
+
         try:
             response = self._client.post(
                 f"{self.server_url}{_get_log_endpoint()}",
-                json={"logs": batch},
+                content=body,
                 headers=headers,
             )
             if response.status_code not in (204, 200):
-                self._fallback_to_console(batch)
-        except httpx.RequestError:
-            self._fallback_to_console(batch)
+                self._report_batch_failure(
+                    batch, f"HTTP {response.status_code}"
+                )
+        except httpx.RequestError as e:
+            self._report_batch_failure(
+                batch, f"{type(e).__name__}: {e}"
+            )
 
-    def _fallback_to_console(self, batch: list[dict]) -> None:
-        """Log entries to console when server is unavailable."""
-        for entry in batch:
-            level = entry.get("level", "INFO")
-            message = entry.get("message", "")
-            context = entry.get("context")
-            if context:
-                message = f"{message} | {context}"
-            log_level = getattr(logging, level, logging.INFO)
-            self._console_logger.log(log_level, message)
+    def _report_batch_failure(self, batch: list[dict], reason: str) -> None:
+        """Note a failed batch send without re-emitting every entry.
+
+        Why not replay each entry: the originals already went to console at
+        emit time via the active handlers (JarvisLogger's StreamHandler for
+        INFO+, propagation to root for everything). Re-emitting on failure
+        produced apparent-duplicate log lines that masked real duplicate
+        execution and made journal analysis unreliable. We accept losing
+        the entries on the remote side (the post is going to fail again
+        next time anyway until auth is fixed) and just record the count.
+        """
+        self._console_logger.warning(
+            "Log batch send failed | reason=%s entries_dropped=%d",
+            reason,
+            len(batch),
+        )
 
     def _log(self, level: str, message: str, **context: Any) -> None:
         """Internal method to queue a log entry."""
