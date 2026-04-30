@@ -143,6 +143,10 @@ class JarvisLogger:
     Sends logs to jarvis-logs server with async batching.
     Falls back to console logging if server is unavailable.
 
+    Instances are cached by service name so that multiple modules
+    creating ``JarvisLogger(service="jarvis-node")`` share a single
+    queue and flush thread (important on resource-constrained devices).
+
     Usage:
         from jarvis_log_client import init, JarvisLogger
 
@@ -155,6 +159,27 @@ class JarvisLogger:
         logger.error("Something went wrong", error=str(e), request_id="abc123")
     """
 
+    _instances: dict[str, "JarvisLogger"] = {}
+    _instances_lock = threading.Lock()
+
+    def __new__(
+        cls,
+        service: str,
+        server_url: str | None = None,
+        console_level: str = "INFO",
+        remote_level: str = "DEBUG",
+        batch_size: int = 50,
+        flush_interval: float = 5.0,
+    ) -> "JarvisLogger":
+        # Cache on service name — the vast majority of callers use
+        # identical defaults so the first instance wins.
+        with cls._instances_lock:
+            if service in cls._instances:
+                return cls._instances[service]
+            instance = super().__new__(cls)
+            cls._instances[service] = instance
+            return instance
+
     def __init__(
         self,
         service: str,
@@ -164,6 +189,11 @@ class JarvisLogger:
         batch_size: int = 50,
         flush_interval: float = 5.0,
     ):
+        # Skip re-init if this is a cached instance
+        if hasattr(self, "_initialized"):
+            return
+        self._initialized = True
+
         self.service = service
         self.server_url = server_url or _get_logs_url()
         self.console_level = getattr(logging, console_level.upper(), logging.WARNING)
@@ -171,8 +201,9 @@ class JarvisLogger:
         self.batch_size = batch_size
         self.flush_interval = flush_interval
 
-        # Log queue for async batching
-        self._queue: queue.Queue = queue.Queue()
+        # Log queue for async batching (bounded to prevent OOM on
+        # resource-constrained devices when the log server is unreachable)
+        self._queue: queue.Queue = queue.Queue(maxsize=10000)
         self._shutdown = threading.Event()
         self._flush_thread: threading.Thread | None = None
 

@@ -105,8 +105,9 @@ class TestJarvisLogger:
     """Tests for JarvisLogger class."""
 
     def setup_method(self):
-        """Clear credentials before each test."""
+        """Clear credentials and instance cache before each test."""
         _reset_auth_state()
+        JarvisLogger._instances.clear()
 
     def test_logger_creation(self):
         """Test basic logger creation."""
@@ -196,8 +197,9 @@ class TestJarvisLoggerFlush:
     """Tests for JarvisLogger flush behavior."""
 
     def setup_method(self):
-        """Clear credentials before each test."""
+        """Clear credentials and instance cache before each test."""
         _reset_auth_state()
+        JarvisLogger._instances.clear()
 
     def test_failed_batch_logs_single_warning_not_per_entry(self):
         """When the remote post fails, the client must NOT re-emit every
