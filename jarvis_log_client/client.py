@@ -195,7 +195,9 @@ class JarvisLogger:
         self._initialized = True
 
         self.service = service
+        self._explicit_url: str | None = server_url  # None = resolve lazily
         self.server_url = server_url or _get_logs_url()
+        self._url_resolved_from_config: bool = False
         self.console_level = getattr(logging, console_level.upper(), logging.WARNING)
         self.remote_level = getattr(logging, remote_level.upper(), logging.DEBUG)
         self.batch_size = batch_size
@@ -209,6 +211,11 @@ class JarvisLogger:
 
         # HTTP client (created lazily in flush thread)
         self._client: httpx.Client | None = None
+
+        # Backoff state: when the server is unreachable, space out retries
+        # instead of spamming every flush_interval (5s)
+        self._consecutive_failures: int = 0
+        self._max_backoff: float = 300.0  # cap at 5 minutes
 
         # Console logger for fallback
         self._console_logger = logging.getLogger(f"jarvis.{service}")
@@ -250,8 +257,15 @@ class JarvisLogger:
                     f"{type(e).__name__}: {e}"
                 )
 
-            # Wait for flush interval or shutdown
-            self._shutdown.wait(timeout=self.flush_interval)
+            # Back off when server is unreachable to avoid spamming journal
+            if self._consecutive_failures > 0:
+                backoff = min(
+                    self.flush_interval * (2 ** self._consecutive_failures),
+                    self._max_backoff,
+                )
+                self._shutdown.wait(timeout=backoff)
+            else:
+                self._shutdown.wait(timeout=self.flush_interval)
 
         # Final flush on shutdown
         try:
@@ -262,6 +276,28 @@ class JarvisLogger:
             )
         if self._client:
             self._client.close()
+
+    def _maybe_resolve_url(self) -> None:
+        """Re-resolve the logs URL from config-client if not yet resolved.
+
+        The logger is often created before the config-client is initialized
+        (especially on Pi nodes), so the URL falls back to localhost:7702.
+        On the first connection failure we retry config-client resolution
+        in case it has since been initialized with the correct host URL.
+        """
+        if self._explicit_url or self._url_resolved_from_config:
+            return
+        try:
+            from jarvis_config_client import get_service_url
+            url = get_service_url("logs")
+            if url and url != self.server_url:
+                self._console_logger.info(
+                    "Log client URL updated from config-service: %s", url
+                )
+                self.server_url = url
+                self._url_resolved_from_config = True
+        except (ImportError, RuntimeError):
+            pass
 
     def _flush_batch(self) -> None:
         """Flush pending logs to server."""
@@ -298,14 +334,25 @@ class JarvisLogger:
                 content=body,
                 headers=headers,
             )
-            if response.status_code not in (204, 200):
+            if response.status_code in (204, 200):
+                if self._consecutive_failures > 0:
+                    self._console_logger.info(
+                        "Log server reconnected after %d failures",
+                        self._consecutive_failures,
+                    )
+                self._consecutive_failures = 0
+            else:
+                self._consecutive_failures += 1
                 self._report_batch_failure(
                     batch, f"HTTP {response.status_code}"
                 )
         except httpx.RequestError as e:
+            self._consecutive_failures += 1
             self._report_batch_failure(
                 batch, f"{type(e).__name__}: {e}"
             )
+            # URL may have been wrong (localhost fallback before config-client init)
+            self._maybe_resolve_url()
 
     def _report_batch_failure(self, batch: list[dict], reason: str) -> None:
         """Note a failed batch send without re-emitting every entry.
@@ -318,10 +365,15 @@ class JarvisLogger:
         the entries on the remote side (the post is going to fail again
         next time anyway until auth is fixed) and just record the count.
         """
+        next_backoff = min(
+            self.flush_interval * (2 ** self._consecutive_failures),
+            self._max_backoff,
+        )
         self._console_logger.warning(
-            "Log batch send failed | reason=%s entries_dropped=%d",
+            "Log batch send failed | reason=%s entries_dropped=%d next_retry=%.0fs",
             reason,
             len(batch),
+            next_backoff,
         )
 
     def _log(self, level: str, message: str, **context: Any) -> None:
