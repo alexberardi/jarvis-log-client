@@ -280,6 +280,65 @@ class TestJarvisLoggerFlush:
         assert "body" in captured, "post() was not called"
         assert b"0.963" in captured["body"]
 
+    def test_persistent_auth_failures_disable_remote_logging(self):
+        """After AUTH_GIVEUP_THRESHOLD consecutive 401/403 responses the
+        client should mark itself disabled, drain its queue, log one error,
+        and stop calling .post() on subsequent flushes.
+
+        Why: kitchen Pi was retrying every 5 min for days against an old
+        log endpoint that consistently returned 403. The retries did
+        nothing useful and kept the queue + thread busy."""
+        logger = JarvisLogger(service="test", console_level="CRITICAL")
+        logger.shutdown()
+        logger._shutdown.clear()
+
+        client = MagicMock()
+        rejected = MagicMock()
+        rejected.status_code = 403
+        client.post.return_value = rejected
+        logger._client = client
+
+        # Push past the giveup threshold.
+        for _ in range(logger._auth_giveup_threshold):
+            logger.info("doomed entry")
+            logger._flush_batch()
+
+        assert logger.is_remote_disabled, "remote logging should be disabled"
+        status = logger.get_remote_status()
+        assert status["disabled"] is True
+        assert "403" in (status["disabled_reason"] or "")
+
+        # Subsequent log calls must NOT enqueue, and flush must NOT post.
+        client.post.reset_mock()
+        for _ in range(20):
+            logger.info("dropped entry")
+        logger._flush_batch()
+        assert client.post.call_count == 0
+        assert logger.get_remote_status()["queue_depth"] == 0
+
+    def test_transient_failures_do_not_disable_remote_logging(self):
+        """Network errors (RequestError) and 5xx responses must NOT trip the
+        auth-giveup path — they're transient and should keep retrying with
+        backoff. Only 401/403 indicates an unrecoverable auth misconfig."""
+        logger = JarvisLogger(service="test", console_level="CRITICAL")
+        logger.shutdown()
+        logger._shutdown.clear()
+
+        client = MagicMock()
+        rejected = MagicMock()
+        rejected.status_code = 503
+        client.post.return_value = rejected
+        logger._client = client
+
+        for _ in range(logger._auth_giveup_threshold + 5):
+            logger.info("entry")
+            logger._flush_batch()
+
+        assert not logger.is_remote_disabled, (
+            "5xx should not disable remote logging"
+        )
+        assert logger._consecutive_auth_failures == 0
+
     def test_flush_loop_survives_serializer_crash(self):
         """If _flush_batch raises (e.g. broken httpx mock), the daemon loop
         keeps running so the next batch still gets a chance to be sent."""

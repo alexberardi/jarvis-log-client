@@ -217,6 +217,16 @@ class JarvisLogger:
         self._consecutive_failures: int = 0
         self._max_backoff: float = 300.0  # cap at 5 minutes
 
+        # Auth-failure giveup: 401/403 means our credentials are wrong, not
+        # that the network is flaky. Retrying every 5 minutes for days burns
+        # battery, churns log entries through the queue, and never recovers
+        # without a redeploy. After AUTH_GIVEUP_THRESHOLD consecutive 401/403
+        # responses we disable remote logging until the next process restart.
+        self._consecutive_auth_failures: int = 0
+        self._auth_giveup_threshold: int = 10
+        self._remote_disabled: bool = False
+        self._remote_disabled_reason: str | None = None
+
         # Console logger for fallback
         self._console_logger = logging.getLogger(f"jarvis.{service}")
         self._console_logger.setLevel(logging.DEBUG)
@@ -301,6 +311,16 @@ class JarvisLogger:
 
     def _flush_batch(self) -> None:
         """Flush pending logs to server."""
+        # Once we've given up on auth, drain the queue so it doesn't pile up
+        # forever and keep memory bounded.
+        if self._remote_disabled:
+            try:
+                while True:
+                    self._queue.get_nowait()
+            except queue.Empty:
+                pass
+            return
+
         batch = []
         while len(batch) < self.batch_size:
             try:
@@ -341,18 +361,66 @@ class JarvisLogger:
                         self._consecutive_failures,
                     )
                 self._consecutive_failures = 0
+                self._consecutive_auth_failures = 0
             else:
                 self._consecutive_failures += 1
+                if response.status_code in (401, 403):
+                    self._consecutive_auth_failures += 1
+                    if self._consecutive_auth_failures >= self._auth_giveup_threshold:
+                        self._disable_remote(
+                            f"HTTP {response.status_code} after "
+                            f"{self._consecutive_auth_failures} attempts"
+                        )
+                        return
+                else:
+                    self._consecutive_auth_failures = 0
                 self._report_batch_failure(
                     batch, f"HTTP {response.status_code}"
                 )
         except httpx.RequestError as e:
             self._consecutive_failures += 1
+            self._consecutive_auth_failures = 0  # network error, not auth
             self._report_batch_failure(
                 batch, f"{type(e).__name__}: {e}"
             )
             # URL may have been wrong (localhost fallback before config-client init)
             self._maybe_resolve_url()
+
+    def _disable_remote(self, reason: str) -> None:
+        """Stop sending logs remotely after persistent auth failures.
+
+        Drains the in-memory queue and emits a single console warning so
+        the operator can spot it. Callers that want to surface this to a UI
+        should poll ``is_remote_disabled`` / ``get_remote_status()``.
+        """
+        self._remote_disabled = True
+        self._remote_disabled_reason = reason
+        self._console_logger.error(
+            "Remote logging disabled: %s. Logs will continue to console only "
+            "until process restart.",
+            reason,
+        )
+        # Drain queue immediately to free memory.
+        try:
+            while True:
+                self._queue.get_nowait()
+        except queue.Empty:
+            pass
+
+    @property
+    def is_remote_disabled(self) -> bool:
+        """True if remote logging has been turned off due to auth failures."""
+        return self._remote_disabled
+
+    def get_remote_status(self) -> dict[str, Any]:
+        """Snapshot of remote-logging health for UI surfacing."""
+        return {
+            "disabled": self._remote_disabled,
+            "disabled_reason": self._remote_disabled_reason,
+            "consecutive_failures": self._consecutive_failures,
+            "consecutive_auth_failures": self._consecutive_auth_failures,
+            "queue_depth": self._queue.qsize(),
+        }
 
     def _report_batch_failure(self, batch: list[dict], reason: str) -> None:
         """Note a failed batch send without re-emitting every entry.
@@ -387,8 +455,8 @@ class JarvisLogger:
                 console_msg = f"{message} | {context}"
             self._console_logger.log(level_value, console_msg)
 
-        # Queue for remote if level is high enough
-        if level_value >= self.remote_level:
+        # Queue for remote if level is high enough and remote isn't disabled
+        if level_value >= self.remote_level and not self._remote_disabled:
             entry = {
                 "timestamp": datetime.utcnow().isoformat(),
                 "service": self.service,
