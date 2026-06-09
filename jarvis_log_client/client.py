@@ -162,6 +162,25 @@ class JarvisLogger:
     _instances: dict[str, "JarvisLogger"] = {}
     _instances_lock = threading.Lock()
 
+    # Class-level (process-wide) flush worker. One thread regardless of how
+    # many JarvisLogger instances exist. Earlier design started a daemon
+    # ``_flush_loop`` per instance; under code paths that legitimately
+    # re-instantiate JarvisLogger (Pantry install re-imports custom_commands
+    # modules, mobile-driven settings snapshot triggers ``refresh_now()``,
+    # etc.) thread count grew unbounded. On a Pi Zero 2W, observed 24 idle
+    # flush threads contending for the GIL after a handful of installs,
+    # adding multi-second latency to the wake loop.
+    #
+    # The per-service singleton above already prevents same-service re-init
+    # in normal operation, but it's not sufficient: every UNIQUE service
+    # string still spawned its own thread, and any future regression that
+    # bypassed the singleton (e.g. a different class instance from a stale
+    # sys.modules path) would silently leak again. Collapsing to one shared
+    # thread bounds this at one no matter what.
+    _global_thread: "threading.Thread | None" = None
+    _global_thread_lock = threading.Lock()
+    _global_shutdown = threading.Event()
+
     def __new__(
         cls,
         service: str,
@@ -207,10 +226,16 @@ class JarvisLogger:
         # resource-constrained devices when the log server is unreachable)
         self._queue: queue.Queue = queue.Queue(maxsize=10000)
         self._shutdown = threading.Event()
-        self._flush_thread: threading.Thread | None = None
 
-        # HTTP client (created lazily in flush thread)
+        # HTTP client created lazily in the shared flush worker on first
+        # batch from this instance — different instances can target
+        # different ``server_url``s so each owns its own client.
         self._client: httpx.Client | None = None
+
+        # Per-instance backoff window. The shared global flush worker
+        # checks this before calling ``_flush_batch`` so a slow server
+        # (5 min cap) doesn't starve other instances' flushes.
+        self._next_retry_at_monotonic: float = 0.0
 
         # Backoff state: when the server is unreachable, space out retries
         # instead of spamming every flush_interval (5s)
@@ -230,6 +255,21 @@ class JarvisLogger:
         # Console logger for fallback
         self._console_logger = logging.getLogger(f"jarvis.{service}")
         self._console_logger.setLevel(logging.DEBUG)
+        # propagate=False is load-bearing: without it every emit duplicates.
+        # Two propagation paths used to fire:
+        #   1) Ancestor JarvisLoggers — e.g. JarvisLogger(service="cmd.spotify")
+        #      installs a StreamHandler on logger "jarvis.cmd.spotify" with the
+        #      same formatter, so a sibling like "jarvis.cmd.spotify.keepalive"
+        #      emits ONCE on its own handler and AGAIN on the ancestor's,
+        #      producing identical [INFO] lines in journalctl.
+        #   2) The root logger — main.py runs alembic migrations on startup, and
+        #      ``alembic.ini``'s ``[handler_console]`` formatter
+        #      (``%(levelname)-5.5s [%(name)s] %(message)s``) is installed on
+        #      root and STAYS installed for the rest of the process. Every
+        #      JarvisLogger emit propagated up and emitted a third line.
+        # The remote pipeline is independent of stdlib propagation, so we just
+        # turn propagation off and keep one handler per logger.
+        self._console_logger.propagate = False
         if not self._console_logger.handlers:
             handler = logging.StreamHandler()
             handler.setLevel(self.console_level)
@@ -238,54 +278,103 @@ class JarvisLogger:
             )
             self._console_logger.addHandler(handler)
 
-        # Start background flush thread
-        self._start_flush_thread()
+        # Ensure the class-level flush worker is running. Idempotent — only
+        # the first instance actually spawns the thread.
+        type(self)._ensure_global_thread()
 
         # Register shutdown hook
         atexit.register(self.shutdown)
 
-    def _start_flush_thread(self) -> None:
-        """Start the background thread for flushing logs."""
-        self._flush_thread = threading.Thread(target=self._flush_loop, daemon=True)
-        self._flush_thread.start()
+    @classmethod
+    def _ensure_global_thread(cls) -> None:
+        """Start the single class-level flush worker on first call.
 
-    def _flush_loop(self) -> None:
-        """Background loop that flushes logs periodically."""
-        self._client = httpx.Client(timeout=10.0)
-
-        while not self._shutdown.is_set():
-            try:
-                self._flush_batch()
-            except (httpx.HTTPError, OSError) as e:
-                self._console_logger.warning(f"Log flush error ({type(e).__name__}): {e}")
-            except Exception as e:
-                # Anything else (TypeError from a bad serialize, etc.) must
-                # NOT take the daemon thread down — that would silently
-                # disable remote logging for the rest of the process.
-                self._console_logger.error(
-                    f"Log flush thread caught unexpected error, continuing: "
-                    f"{type(e).__name__}: {e}"
-                )
-
-            # Back off when server is unreachable to avoid spamming journal
-            if self._consecutive_failures > 0:
-                backoff = min(
-                    self.flush_interval * (2 ** self._consecutive_failures),
-                    self._max_backoff,
-                )
-                self._shutdown.wait(timeout=backoff)
-            else:
-                self._shutdown.wait(timeout=self.flush_interval)
-
-        # Final flush on shutdown
-        try:
-            self._flush_batch()
-        except Exception as e:
-            self._console_logger.warning(
-                f"Final log flush failed: {type(e).__name__}: {e}"
+        Idempotent and thread-safe. Subsequent calls are cheap no-ops once
+        the thread is running. The thread is a daemon so it doesn't block
+        process exit; ``atexit`` triggers a final flush on each instance.
+        """
+        with cls._global_thread_lock:
+            if cls._global_thread is not None and cls._global_thread.is_alive():
+                return
+            cls._global_shutdown.clear()
+            cls._global_thread = threading.Thread(
+                target=cls._global_flush_loop,
+                daemon=True,
+                name="JarvisLogger-flush",
             )
-        if self._client:
-            self._client.close()
+            cls._global_thread.start()
+
+    @classmethod
+    def _global_flush_loop(cls) -> None:
+        """Single process-wide flush worker — drains every instance's queue.
+
+        Sleeps a fixed 1 s between rounds (much shorter than any single
+        instance's ``flush_interval`` so per-instance backoff windows
+        remain accurate). Each ``_flush_batch_with_backoff`` call is a
+        fast no-op when the instance has nothing to send or is in its
+        backoff window, so iterating ~30 instances takes microseconds.
+        """
+        import time as _time
+
+        while not cls._global_shutdown.is_set():
+            # Snapshot instances under the lock so re-entrancy from a
+            # logger.info() call during iteration can't mutate underfoot.
+            with cls._instances_lock:
+                instances = list(cls._instances.values())
+
+            now = _time.monotonic()
+            for inst in instances:
+                if now < inst._next_retry_at_monotonic:
+                    continue
+                try:
+                    inst._flush_batch()
+                except (httpx.HTTPError, OSError) as e:
+                    inst._console_logger.warning(
+                        f"Log flush error ({type(e).__name__}): {e}"
+                    )
+                except Exception as e:
+                    # Anything else (serialize bug, etc.) must NOT take the
+                    # worker down — that would silently disable remote
+                    # logging for the rest of the process.
+                    inst._console_logger.error(
+                        f"Log flush worker caught unexpected error, "
+                        f"continuing: {type(e).__name__}: {e}"
+                    )
+
+                # After the call, update the per-instance backoff window
+                # based on whatever ``_flush_batch`` left in
+                # ``_consecutive_failures``.
+                if inst._consecutive_failures > 0:
+                    backoff = min(
+                        inst.flush_interval * (2 ** inst._consecutive_failures),
+                        inst._max_backoff,
+                    )
+                    inst._next_retry_at_monotonic = _time.monotonic() + backoff
+                else:
+                    inst._next_retry_at_monotonic = 0.0
+
+            # 1 s tick. Doesn't matter that it's shorter than the default
+            # 5 s flush_interval — the backoff check above means each
+            # instance still only sends every flush_interval seconds when
+            # healthy (because _flush_batch drains at most batch_size and
+            # is a no-op when the queue is empty).
+            cls._global_shutdown.wait(timeout=1.0)
+
+        # Final flush across all instances on shutdown.
+        with cls._instances_lock:
+            instances = list(cls._instances.values())
+        for inst in instances:
+            try:
+                inst._flush_batch()
+            except Exception as e:
+                inst._console_logger.warning(
+                    f"Final log flush failed: {type(e).__name__}: {e}"
+                )
+            if inst._client is not None:
+                try:
+                    inst._client.close()
+                except Exception:
+                    pass
 
     def _maybe_resolve_url(self) -> None:
         """Re-resolve the logs URL from config-client if not yet resolved.
@@ -347,6 +436,13 @@ class JarvisLogger:
                 f"Log batch dropped (serialize error): {type(e).__name__}: {e}"
             )
             return
+
+        # Lazy-create the httpx client on first batch from this instance.
+        # The shared global flush worker doesn't own a client (each instance
+        # may have its own ``server_url``), so the instance creates it on
+        # demand.
+        if self._client is None:
+            self._client = httpx.Client(timeout=10.0)
 
         try:
             response = self._client.post(
@@ -490,10 +586,21 @@ class JarvisLogger:
         self._log("CRITICAL", message, **context)
 
     def shutdown(self) -> None:
-        """Gracefully shutdown the logger."""
+        """Best-effort flush of this instance's queue on shutdown.
+
+        The flush thread is class-level (one per process) so this method
+        no longer joins a per-instance thread — it just drains whatever
+        is queued here through ``_flush_batch``. The class-level worker
+        keeps running for any other still-live instances.
+
+        Process exit drains the global thread via the daemon flag plus
+        ``atexit`` hooks set in ``__init__`` calling this method.
+        """
         self._shutdown.set()
-        if self._flush_thread and self._flush_thread.is_alive():
-            self._flush_thread.join(timeout=5.0)
+        try:
+            self._flush_batch()
+        except Exception:
+            pass
 
     def flush(self) -> None:
         """Manually trigger a flush of pending logs."""

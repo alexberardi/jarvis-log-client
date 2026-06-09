@@ -1,6 +1,7 @@
 """Tests for JarvisLogger client."""
 
 import os
+import threading
 import time
 from unittest.mock import patch, MagicMock
 
@@ -172,13 +173,57 @@ class TestJarvisLogger:
         assert not logger._queue.empty()
         logger.shutdown()
 
-    def test_shutdown_stops_thread(self):
-        """Test that shutdown stops the flush thread."""
-        logger = JarvisLogger(service="test")
-        assert logger._flush_thread.is_alive()
+    def test_many_instances_share_one_flush_thread(self):
+        """The whole point of the refactor: N JarvisLogger instances must
+        result in exactly ONE flush thread, not N.
 
+        Pre-fix on jarvis-dev, 24 ``_flush_loop`` threads accumulated after
+        a handful of Pantry installs (each install re-imports custom_commands
+        modules whose module-level ``logger = JarvisLogger(...)`` lines each
+        spawned a daemon thread). The class-level worker collapses that to 1.
+
+        We count Python-level threads named "JarvisLogger-flush" — that's
+        the worker's name. Any other count means we regressed.
+        """
+        # Make a bunch of distinct-service loggers + some duplicates.
+        loggers = [JarvisLogger(service=f"test.svc.{i}") for i in range(20)]
+        loggers += [JarvisLogger(service="test.svc.5") for _ in range(5)]
+
+        # Give the global thread a moment to be ensured.
+        time.sleep(0.1)
+
+        flush_threads = [
+            t for t in threading.enumerate()
+            if t.name == "JarvisLogger-flush"
+        ]
+        assert len(flush_threads) == 1, (
+            f"expected exactly 1 JarvisLogger-flush thread, got "
+            f"{len(flush_threads)}: {[t.name for t in flush_threads]}"
+        )
+
+        for lg in loggers:
+            lg.shutdown()
+
+    def test_shutdown_drains_queue_and_global_thread_keeps_running(self):
+        """Shutdown is per-instance and drains its queue; the class-level
+        flush worker stays alive for any other still-live loggers.
+
+        Per-instance threads were removed because Pantry-install re-imports
+        and other code paths legitimately re-instantiate JarvisLogger,
+        which accumulated daemon threads (~24 on jarvis-dev). See client.py
+        comments above the class-level ``_global_thread`` field.
+        """
+        logger = JarvisLogger(service="test")
+        # The class-level thread must be running after at least one instance.
+        assert JarvisLogger._global_thread is not None
+        assert JarvisLogger._global_thread.is_alive()
+
+        logger.warning("queued")
+        assert not logger._queue.empty()
         logger.shutdown()
-        assert not logger._flush_thread.is_alive()
+        # Shutdown drains this instance's queue (best-effort).
+        # The class thread keeps running for any other JarvisLogger.
+        assert JarvisLogger._global_thread.is_alive()
 
     def test_context_is_optional(self):
         """Test logging without context."""
@@ -191,6 +236,39 @@ class TestJarvisLogger:
         entry = logger._queue.get_nowait()
         assert entry["context"] is None
         logger.shutdown()
+
+    def test_console_logger_does_not_propagate(self):
+        """Records must not propagate to ancestor or root handlers.
+
+        Regression: when JarvisLogger(service="cmd.spotify.keepalive") emits,
+        records used to also fire on JarvisLogger(service="cmd.spotify")'s
+        handler (ancestor) AND on the root handler that ``alembic.ini``'s
+        ``[handler_console]`` installs during migrations. Result: every line
+        appeared 2-3× in journalctl. Setting propagate=False on the per-service
+        console logger is the fix.
+        """
+        import io
+        import logging
+
+        root = logging.getLogger()
+        root_buf = io.StringIO()
+        root_handler = logging.StreamHandler(root_buf)
+        root_handler.setLevel(logging.DEBUG)
+        prior_root_level = root.level
+        root.addHandler(root_handler)
+        root.setLevel(logging.DEBUG)
+        try:
+            logger = JarvisLogger(
+                service="test-no-propagate",
+                console_level="CRITICAL",
+            )
+            assert logger._console_logger.propagate is False
+            logger.info("must not reach root")
+            assert "must not reach root" not in root_buf.getvalue()
+            logger.shutdown()
+        finally:
+            root.removeHandler(root_handler)
+            root.setLevel(prior_root_level)
 
 
 class TestJarvisLoggerFlush:
@@ -356,10 +434,16 @@ class TestJarvisLoggerFlush:
 
         logger._flush_batch = boom
 
-        time.sleep(0.25)
+        time.sleep(2.5)  # global worker tick is 1 s
 
-        assert logger._flush_thread.is_alive(), "flush thread died on RuntimeError"
-        assert boom_count["n"] >= 2, "flush_loop did not retry after first crash"
+        assert JarvisLogger._global_thread is not None
+        assert JarvisLogger._global_thread.is_alive(), (
+            "global flush worker died on RuntimeError — it must catch and "
+            "continue so one bad logger doesn't kill the whole pipeline"
+        )
+        assert boom_count["n"] >= 2, (
+            "global worker did not retry after first crash"
+        )
 
         logger.shutdown()
 
