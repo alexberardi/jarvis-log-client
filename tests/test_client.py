@@ -270,6 +270,84 @@ class TestJarvisLogger:
             root.removeHandler(root_handler)
             root.setLevel(prior_root_level)
 
+    def test_underlying_logger_has_propagate_false(self):
+        """PIN: the stdlib Logger that JarvisLogger wraps must have
+        ``propagate`` set to False.
+
+        This is the documented triple-emission fix (client.py: the per-service
+        ``logging.getLogger("jarvis.<service>")`` sets ``propagate = False``).
+        We assert it both on the instance attribute the logger exposes and on
+        the same logger fetched independently via ``logging.getLogger`` to prove
+        the flag lives on the shared, named stdlib logger — not on some private
+        wrapper. Reverting the fix (dropping the ``propagate = False`` line, the
+        stdlib default being True) makes both assertions fail.
+
+        Runs fully offline: console_level=CRITICAL suppresses console output and
+        nothing here touches the logs server.
+        """
+        import logging
+
+        logger = JarvisLogger(
+            service="test-propagate-flag",
+            console_level="CRITICAL",
+        )
+        try:
+            # The attribute JarvisLogger exposes for its underlying logger.
+            assert logger._console_logger.propagate is False
+            # Independently fetched by name — same singleton stdlib Logger.
+            named = logging.getLogger("jarvis.test-propagate-flag")
+            assert named is logger._console_logger
+            assert named.propagate is False
+        finally:
+            logger.shutdown()
+
+    def test_single_emit_not_duplicated_to_ancestor_logger(self):
+        """PIN: emitting one record must reach exactly one handler, not also
+        the ancestor JarvisLogger's handler.
+
+        This reproduces propagation path #1 from the client.py comment: a
+        child service name (``jarvis.cmd.spotify.keepalive``) used to emit once
+        on its own StreamHandler AND again on the ancestor
+        (``jarvis.cmd.spotify``) handler, producing duplicate journal lines.
+        With ``propagate = False`` the ancestor never sees the child's record.
+
+        We install a counting handler on the ancestor logger and assert it
+        captures zero records when the child emits. Reverting the fix
+        (propagate defaults to True) makes the ancestor see the record and this
+        assertion fails. No logs server involved — pure stdlib handlers.
+        """
+        import logging
+
+        ancestor = logging.getLogger("jarvis.cmd.spotify")
+        records: list[logging.LogRecord] = []
+
+        class _CountingHandler(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                records.append(record)
+
+        counting = _CountingHandler()
+        counting.setLevel(logging.DEBUG)
+        prior_level = ancestor.level
+        ancestor.addHandler(counting)
+        ancestor.setLevel(logging.DEBUG)
+        try:
+            # console_level=INFO so the child's own handler WOULD emit — the
+            # point is that the ancestor still must not see it.
+            child = JarvisLogger(
+                service="cmd.spotify.keepalive",
+                console_level="INFO",
+            )
+            child.info("emit once")
+            assert child._console_logger.propagate is False
+            assert len(records) == 0, (
+                f"ancestor logger saw {len(records)} record(s); expected 0 — "
+                "child record propagated up (triple-emission regression)"
+            )
+            child.shutdown()
+        finally:
+            ancestor.removeHandler(counting)
+            ancestor.setLevel(prior_level)
+
 
 class TestJarvisLoggerFlush:
     """Tests for JarvisLogger flush behavior."""
