@@ -1,5 +1,8 @@
 # jarvis-log-client
 
+> [!NOTE]
+> **Maintenance only.** This library is kept for [jarvis-node-setup](https://github.com/alexberardi/jarvis-node-setup) (the Raspberry Pi node) and [jarvis-osx-api](https://github.com/alexberardi/jarvis-osx-api). The services it was written for are replaced by jarvisd ([jarvis-server](https://github.com/alexberardi/jarvis-server)); don't use it in new code.
+
 Centralized logging client for jarvis microservices. Sends logs to `jarvis-logs` server with async batching and automatic fallback to console.
 
 ## Installation
